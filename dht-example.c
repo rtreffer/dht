@@ -23,7 +23,7 @@
 static struct sockaddr_storage bootstrap_nodes[MAX_BOOTSTRAP_NODES];
 static int num_bootstrap_nodes = 0;
 
-static volatile sig_atomic_t dumping = 0, searching = 0, exiting = 0;
+static volatile sig_atomic_t dumping = 1, searching = 0, exiting = 0;
 
 static void
 sigdump(int signo)
@@ -68,7 +68,7 @@ init_signals(void)
     sigaction(SIGINT, &sa, NULL);
 }
 
-const unsigned char hash[20] = {
+unsigned char hash[20] = {
     0x54, 0x57, 0x87, 0x89, 0xdf, 0xc4, 0x23, 0xee, 0xf6, 0x03,
     0x1f, 0x81, 0x94, 0xa9, 0x3a, 0x16, 0x98, 0x8b, 0x72, 0x7b
 };
@@ -95,10 +95,8 @@ main(int argc, char **argv)
 {
     int i, rc, fd;
     int s = -1, s6 = -1, port;
-    int have_id = 0;
-    unsigned char myid[20];
+    dht_sec_key *key;
     time_t tosleep = 0;
-    char *id_file = "dht-example.id";
     int opt;
     int quiet = 0, ipv4 = 1, ipv6 = 1;
     struct sockaddr_in sin;
@@ -115,7 +113,7 @@ main(int argc, char **argv)
 
 
     while(1) {
-        opt = getopt(argc, argv, "q46b:i:");
+        opt = getopt(argc, argv, "q46b:");
         if(opt < 0)
             break;
 
@@ -139,58 +137,19 @@ main(int argc, char **argv)
             goto usage;
         }
             break;
-        case 'i':
-            id_file = optarg;
-            break;
         default:
             goto usage;
         }
     }
 
-    /* Ids need to be distributed evenly, so you cannot just use your
-       bittorrent id.  Either generate it randomly, or take the SHA-1 of
-       something. */
-    fd = open(id_file, O_RDONLY);
-    if(fd >= 0) {
-        rc = read(fd, myid, 20);
-        if(rc == 20)
-            have_id = 1;
-        close(fd);
-    }
-    
-    fd = open("/dev/urandom", O_RDONLY);
-    if(fd < 0) {
-        perror("open(random)");
-        exit(1);
-    }
-
-    if(!have_id) {
-        int ofd;
-
-        rc = read(fd, myid, 20);
-        if(rc < 0) {
-            perror("read(random)");
-            exit(1);
-        }
-        have_id = 1;
-        close(fd);
-
-        ofd = open(id_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if(ofd >= 0) {
-            rc = write(ofd, myid, 20);
-            if(rc < 20)
-                unlink(id_file);
-            close(ofd);
-        }
-    }
-
     {
+        fd = open("/dev/urandom",O_RDONLY);
         unsigned seed;
         read(fd, &seed, sizeof(seed));
         srandom(seed);
+        read(fd, &hash, 20);
+        close(fd);
     }
-
-    close(fd);
 
     if(argc < 2)
         goto usage;
@@ -297,7 +256,8 @@ main(int argc, char **argv)
     }
 
     /* Init the dht.  This sets the socket into non-blocking mode. */
-    rc = dht_init(s, s6, myid, (unsigned char*)"JC\0\0");
+    key = dht_generate_key(1);
+    rc = dht_init(s, s6, key, (unsigned char*)"JC\0\0");
     if(rc < 0) {
         perror("dht_init");
         exit(1);
@@ -385,10 +345,10 @@ main(int argc, char **argv)
         }
 
         /* For debugging, or idle curiosity. */
-        if(dumping) {
+        //if(dumping) {
             dht_dump_tables(stdout);
-            dumping = 0;
-        }
+        //    dumping = 0;
+        //}
     }
 
     {
@@ -404,7 +364,7 @@ main(int argc, char **argv)
     return 0;
     
  usage:
-    printf("Usage: dht-example [-q] [-4] [-6] [-i filename] [-b address]...\n"
+    printf("Usage: dht-example [-q] [-4] [-6] [-b address]...\n"
            "                   port [address port]...\n");
     exit(1);
 }

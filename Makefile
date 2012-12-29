@@ -1,5 +1,5 @@
-CFLAGS = -g -Wall
-LDLIBS = -lcrypt
+LDLIBS = -lcrypt -lssl
+CFLAGS = -g -Wall -lcrypt -lssl
 
 dht-example: dht-example.o dht.o
 

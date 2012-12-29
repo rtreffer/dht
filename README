@@ -1,6 +1,8 @@
 The files dht.c and dht.h implement the variant of the Kademlia Distributed
 Hash Table (DHT) used in the Bittorrent network (``mainline'' variant).
 
+The dht.c supports Elliptic Curve Cryptography within the DHT protocol.
+
 The file dht-example.c is a stand-alone program that participates in the
 DHT.  Another example is a patch against Transmission, which you might or
 might not be able to find somewhere.
@@ -13,24 +15,40 @@ dht_periodic whenever any data has arrived from the network.
 All functions return -1 in case of failure, in which case errno is set, or
 a positive value in case of success.
 
+Trying dht-example.c
+********************
+
+ $ apt-get install build-essential libssl-dev  # debian/ubuntu, ymmv
+ $ make
+ $ ./dht-example -4 6668
+
+and on a secondary shell
+
+ $ ./dht-example -4 6669 8.9.12.3 6668  # replace 8.9.12.3 with your ip
+
+Running the dht in-the-wild:
+
+ $ ./dht-example 6668 router.bittorrent.com 6881
+
+This will bootstrap the node against the world-wide dht network and is
+especially usefull to test interoperability.
+
 Initialisation
 **************
+
+* dht_generate_key
+
+This method gernerates a key / node ID that can be used to encrypt dht
+traffic. Can be used without initialising the library.
 
 * dht_init
 
 This must be called before using the library.  You pass it a bound IPv4
-datagram socket, a bound IPv6 datagram socket, and your node id, a 20-octet
-array that should be globally unique.
+datagram socket, a bound IPv6 datagram socket, and your node key (generated
+by dht_generate_key).
 
 If you're on a multi-homed host, you should bind the sockets to one of your
 addresses.
-
-Node ids must be well distributed, so you cannot just use your Bittorrent
-id; you should either generate a truly random value (using plenty of
-entropy), or at least take the SHA-1 of something.  However, it is a good
-idea to keep the id stable, so you may want to store it in stable storage
-at client shutdown.
-
  
 * dht_uninit
 

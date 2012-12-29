@@ -40,6 +40,9 @@ THE SOFTWARE.
 #include <fcntl.h>
 #include <sys/time.h>
 
+#define true ((unsigned char)1)
+#define false ((unsigned char)0)
+
 #ifndef WIN32
 #include <arpa/inet.h>
 #include <sys/types.h>
@@ -130,6 +133,8 @@ struct node {
     unsigned char id[20];
     struct sockaddr_storage ss;
     int sslen;
+    unsigned char encryption_version;  /* saving encryption version - currently only version 1 is supported */
+    unsigned char encryption_verified; /* set to true if the encryption was verified */
     time_t time;                /* time of last message received */
     time_t reply_time;          /* time of last correct reply received */
     time_t pinged_time;         /* time of last request */
@@ -152,13 +157,13 @@ struct search_node {
     unsigned char id[20];
     struct sockaddr_storage ss;
     int sslen;
-    time_t request_time;        /* the time of the last unanswered request */
-    time_t reply_time;          /* the time of the last reply */
+    time_t request_time;                /* the time of the last unanswered request */
+    time_t reply_time;                  /* the time of the last reply */
     int pinged;
     unsigned char token[40];
     int token_len;
-    int replied;                /* whether we have received a reply */
-    int acked;                  /* whether they acked our announcement */
+    int replied;                        /* whether we have received a reply */
+    int acked;                          /* whether they acked our announcement */
 };
 
 /* When performing a search, we search for up to SEARCH_NODES closest nodes
@@ -217,7 +222,7 @@ static void flush_search_node(struct search_node *n, struct search *sr);
 static int send_ping(const struct sockaddr *sa, int salen,
                      const unsigned char *tid, int tid_len);
 static int send_pong(const struct sockaddr *sa, int salen,
-                     const unsigned char *tid, int tid_len);
+                     const unsigned char *tid, int tid_len, const unsigned char *challenge);
 static int send_find_node(const struct sockaddr *sa, int salen,
                           const unsigned char *tid, int tid_len,
                           const unsigned char *target, int want, int confirm);
@@ -245,6 +250,9 @@ static int send_error(const struct sockaddr *sa, int salen,
                       unsigned char *tid, int tid_len,
                       int code, const char *message);
 
+struct node *
+get_node(const struct sockaddr *sa, int salen);
+
 #define ERROR 0
 #define REPLY 1
 #define PING 2
@@ -266,7 +274,10 @@ static int parse_message(const unsigned char *buf, int buflen,
                          unsigned char *nodes6_return, int *nodes6_len,
                          unsigned char *values_return, int *values_len,
                          unsigned char *values6_return, int *values6_len,
-                         int *want_return);
+                         int *want_return,
+                         unsigned char *encryption_variation, 
+                         unsigned char *challenge, 
+                         unsigned char *was_encrypted);
 
 static const unsigned char zeroes[20] = {0};
 static const unsigned char ones[20] = {
@@ -285,6 +296,9 @@ static time_t search_time;
 static time_t confirm_nodes_time;
 static time_t rotate_secrets_time;
 
+static EC_GROUP *group1 = NULL;
+static unsigned char randomSeed[20]; 
+static dht_sec_key *mykey = NULL;
 static unsigned char myid[20];
 static int have_v = 0;
 static unsigned char my_v[9];
@@ -321,6 +335,7 @@ FILE *dht_debug = NULL;
 #ifdef __GNUC__
     __attribute__ ((format (printf, 1, 2)))
 #endif
+
 static void
 debugf(const char *format, ...)
 {
@@ -329,6 +344,7 @@ debugf(const char *format, ...)
     if(dht_debug)
         vfprintf(dht_debug, format, args);
     va_end(args);
+
     fflush(dht_debug);
 }
 
@@ -512,6 +528,26 @@ find_node(const unsigned char *id, int af)
         n = n->next;
     }
     return NULL;
+}
+
+int
+generate_challenge(const struct sockaddr *sa, int salen,
+                   unsigned char *sha1Buf)
+{
+    // check if node can encrypt - then give the challenge
+    struct node *n = get_node(sa, salen);
+
+    if (n && n->encryption_version &&
+        n->encryption_version == 1)
+    {
+        unsigned int randomSeedSize = sizeof(randomSeed);
+        unsigned char keyMsg[randomSeedSize + sizeof(n->id)];
+        memcpy(keyMsg, randomSeed, sizeof(randomSeed));
+        memcpy(keyMsg + randomSeedSize,  n->id, sizeof(n->id));
+    SHA1(keyMsg, sizeof(keyMsg), sha1Buf);
+    return 0;
+    }
+    return -1;
 }
 
 /* Return a random node in a bucket. */
@@ -742,7 +778,7 @@ split_bucket(struct bucket *b)
    the node sent a message, 2 if it sent us a reply. */
 static struct node *
 new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
-         int confirm)
+         int confirm, unsigned char encryption_version)
 {
     struct bucket *b = find_bucket(id, sa->sa_family);
     struct node *n;
@@ -776,6 +812,8 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
                     n->pinged_time = 0;
                 }
             }
+            /* Always update encryption information */
+            n->encryption_version = encryption_version;
             return n;
         }
         n = n->next;
@@ -800,6 +838,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
             n->reply_time = confirm >= 2 ? now.tv_sec : 0;
             n->pinged_time = 0;
             n->pinged = 0;
+            n->encryption_version = encryption_version;
             return n;
         }
         n = n->next;
@@ -845,7 +884,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
         if(split) {
             debugf("Splitting.\n");
             b = split_bucket(b);
-            return new_node(id, sa, salen, confirm);
+            return new_node(id, sa, salen, confirm, encryption_version);
         }
 
         /* No space for this node.  Cache it away for later. */
@@ -863,6 +902,7 @@ new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
         return NULL;
     memcpy(n->id, id, 20);
     memcpy(&n->ss, sa, salen);
+    n->encryption_version = encryption_version;
     n->sslen = salen;
     n->time = confirm ? now.tv_sec : 0;
     n->reply_time = confirm >= 2 ? now.tv_sec : 0;
@@ -1042,7 +1082,6 @@ search_send_get_peers(struct search *sr, struct search_node *n)
        n->request_time >= now.tv_sec - 15)
         return 0;
 
-    debugf("Sending get_peers.\n");
     make_tid(tid, "gp", sr->tid);
     send_get_peers((struct sockaddr*)&n->ss, n->sslen, tid, 4, sr->id, -1,
                    n->reply_time >= now.tv_sec - 15);
@@ -1517,6 +1556,8 @@ dump_bucket(FILE *f, struct bucket *b)
             fprintf(f, "age %ld", (long)(now.tv_sec - n->time));
         if(n->pinged)
             fprintf(f, " (%d)", n->pinged);
+        if (n->encryption_version)
+            fprintf(f, " (encryption_version)");
         if(node_good(n))
             fprintf(f, " (good)");
         fprintf(f, "\n");
@@ -1600,7 +1641,184 @@ dht_dump_tables(FILE *f)
 }
 
 int
-dht_init(int s, int s6, const unsigned char *id, const unsigned char *v)
+dht_ecc_init()
+{
+    dht_random_bytes(randomSeed, sizeof(randomSeed));
+
+    group1 = EC_GROUP_new_by_curve_name(NID_X9_62_c2pnb176v1);
+    if (!group1) {
+        debugf("ECC group NID_X9_62_c2pnb176v1 not found");
+        return -1;
+    }
+    EC_GROUP_set_point_conversion_form(group1, POINT_CONVERSION_COMPRESSED);
+    if (!EC_GROUP_precompute_mult(group1, NULL)) {
+        debugf("ECC group NID_X9_62_c2pnb176v1 could not be precomputed");
+        return -1;
+    }
+    debugf("DHT ECC INIT group 1 %p\n", group1);
+    return 0;
+}
+
+dht_sec_key*
+dht_sec_key_new(unsigned short len, unsigned char variation)
+{
+    dht_sec_key* key = malloc(sizeof(dht_sec_key));
+    if (!key) {
+        debugf("malloc for dht_sec_key failed");
+        return NULL;
+    }
+    key->pair = EC_KEY_new();
+    if (!key->pair) {
+        debugf("malloc for dht_sec_key->pair failed");
+        free(key);
+        return NULL;
+    }
+    switch (variation) {
+    case 1:
+        if (group1 == NULL && dht_ecc_init()) {
+            debugf("group initialization failed");
+            free(key);
+            return NULL;
+        }
+        if (!EC_KEY_set_group(key->pair, group1)) {
+            debugf("group setting failed");
+            EC_KEY_free(key->pair);
+            free(key);
+            return NULL;
+        }
+        break;
+    default:
+        debugf("unknown variation");
+        free(key);
+        return NULL;
+    }
+    key->len = len;
+    key->variation = variation;
+    return (key);
+}
+
+int
+dht_sec_key_generate(dht_sec_key *key)
+{
+    char *hex;
+    char h[47];
+   
+    int i = 0; 
+    memset(h, 0, 47);
+    do {
+        EC_KEY_generate_key(key->pair);
+        switch (key->variation)
+        {
+            case 1:
+                if (group1 == NULL && dht_ecc_init()) {
+            debugf("No key - me unhappy");
+                    return -1;
+                }
+                hex = EC_POINT_point2hex(group1, dht_sec_key_pub(key), POINT_CONVERSION_COMPRESSED, NULL);
+                i++;
+        if (i % 10000 == 0)
+        {
+            debugf("variation %i pair %p pub %p try %i\n", key->variation, key->pair, dht_sec_key_pub(key), i);
+        }
+                break;
+
+        }
+        if (hex != NULL)
+        {
+            memcpy(h, hex, 46);
+            free(hex);
+        }
+    } while (
+        (key->len <= 22 && (h[0] != '0' || h[1] != '2')) ||
+        (key->len <= 21 && (h[2] != 'C' || h[3] != 'A')) ||
+        (key->len <= 20 && (h[4] != 'F' || h[5] != 'E'))
+    );
+    debugf("found key - start\n"); 
+    return 0;
+}
+
+/*
+ * Helper to transform a key from/to binary form
+ */
+unsigned char* dht_sec_key_pub2bin(dht_sec_key *key, unsigned char *buf) {
+    int i, p;
+    unsigned char c[3] = "\0\0\0";
+    unsigned char *hex;
+
+    switch (key->variation) {
+    case 1:
+        if (group1 == NULL && dht_ecc_init()) {
+            return NULL;
+        }
+        hex = (unsigned char *)
+            EC_POINT_point2hex(group1, dht_sec_key_pub(key), POINT_CONVERSION_COMPRESSED, NULL);
+        break;
+    }
+
+    if (buf == NULL) {
+        buf = malloc(key->len * sizeof(unsigned char));
+    }
+
+    p = 0;
+    for (i = (23 - key->len) * 2; i < 46; i += 2) {
+        c[0] = hex[i]; c[1] = hex[i + 1];
+        buf[p++] = (unsigned char)strtol((char*)c, NULL, 16);
+    }
+    free(hex);
+    return (buf);
+}
+
+dht_sec_key*
+dht_sec_key_bin2pub(unsigned char *buf, unsigned short len, unsigned char variation)
+{
+    int i, p;
+    EC_POINT *pub = EC_POINT_new(group1);
+    dht_sec_key *key = dht_sec_key_new(len, variation);
+    unsigned char low;
+    unsigned char high;
+    unsigned char hex[47];
+    hex[0] = '0'; hex[1] = '2';
+    hex[2] = 'C'; hex[3] = 'A'; hex[4] = 'F'; hex[5] = 'E';
+    hex[46] = 0;
+    p = (23 - len) * 2;
+    for (i = 0; i < len; i++) {
+        high = buf[i] / 16; low = buf[i] % 16;
+        hex[p++] = (unsigned char)(0x30 + high + ((high >= 10) ? 7 : 0));
+        hex[p++] = (unsigned char)(0x30 + low + ((low >= 10) ? 7 : 0));
+    }
+    EC_POINT_hex2point(group1, (char*)hex, pub, NULL);
+    EC_KEY_set_public_key(key->pair, pub);
+    EC_POINT_free(pub);
+    return (key);
+}
+
+void*
+key_derivation_function(const void *input, size_t ilen, void *output, size_t *olen)
+{
+        if (*olen < SHA512_DIGEST_LENGTH) {
+                return NULL;
+        }
+        *olen = SHA512_DIGEST_LENGTH;
+        return (SHA512(input, ilen, output));
+}
+
+dht_sec_key*
+dht_generate_key(unsigned short variation)
+{
+    dht_sec_key *key;
+
+    if (variation != 1) {
+        // currently not supported
+        return NULL;
+    }
+    key = dht_sec_key_new(20, variation);
+    dht_sec_key_generate(key);
+
+    return (key);
+}
+
+int
+dht_init(int s, int s6, dht_sec_key *key, const unsigned char *v)
 {
     int rc;
 
@@ -1637,7 +1855,9 @@ dht_init(int s, int s6, const unsigned char *id, const unsigned char *v)
             goto fail;
     }
 
-    memcpy(myid, id, 20);
+    mykey = key;
+    dht_sec_key_pub2bin(key, myid);
+
     if(v) {
         memcpy(my_v, "1:v4:", 5);
         memcpy(my_v + 5, v, 4);
@@ -1871,10 +2091,13 @@ dht_periodic(const void *buf, size_t buflen,
 {
     gettimeofday(&now, NULL);
 
-    if(buflen > 0) {
+    if(buflen > 0 && buf != NULL) {
         int message;
         unsigned char tid[16], id[20], info_hash[20], target[20];
+        unsigned char challenge[20];
+        unsigned char was_encrypted = false;
         unsigned char nodes[256], nodes6[1024], token[128];
+        unsigned char encryption_variation = 0;
         int tid_len = 16, token_len = 128;
         int nodes_len = 256, nodes6_len = 1024;
         unsigned short port;
@@ -1901,7 +2124,7 @@ dht_periodic(const void *buf, size_t buflen,
                                 target, &port, token, &token_len,
                                 nodes, &nodes_len, nodes6, &nodes6_len,
                                 values, &values_len, values6, &values6_len,
-                                &want);
+                                &want, &encryption_variation, &challenge, &was_encrypted);
 
         if(message < 0 || message == ERROR || id_cmp(id, zeroes) == 0) {
             debugf("Unparseable message: ");
@@ -1923,6 +2146,19 @@ dht_periodic(const void *buf, size_t buflen,
             }
         }
 
+        /* The node is not yet verified but it is telling us
+           it can do encryption. Ping it encrypted to see if
+           it can do encryption correctly. If it can't it will
+           get blacklisted */
+        struct node *n = get_node(from, fromlen);
+        if (n && n->encryption_version &&
+            n->encryption_version == 1 &&
+            message != PING &&
+            message > REPLY &&
+            n->encryption_verified == false) {
+            dht_ping_node((struct sockaddr *) from, fromlen);    
+        }    
+
         switch(message) {
         case REPLY:
             if(tid_len != 4) {
@@ -1936,8 +2172,23 @@ dht_periodic(const void *buf, size_t buflen,
                 goto dontread;
             }
             if(tid_match(tid, "pn", NULL)) {
+                if (encryption_variation == 1 &&
+                    was_encrypted && 
+                    n && n->encryption_version && n->encryption_version == 1) {
+					unsigned char generated_challenge[20];
+					int error = generate_challenge(from, fromlen, generated_challenge);
+					if (error == 0) {
+				    	if (challenge && generated_challenge &&
+				    		memcmp(challenge, generated_challenge, 20) == 0) {
+					    	n->encryption_verified = true;
+					    } else {
+						    blacklist_node(id, from, fromlen);
+						    goto dontread;
+					    }
+				    }
+                }
                 debugf("Pong!\n");
-                new_node(id, from, fromlen, 2);
+                new_node(id, from, fromlen, 2, encryption_variation);
             } else if(tid_match(tid, "fn", NULL) ||
                       tid_match(tid, "gp", NULL)) {
                 int gp = 0;
@@ -1953,10 +2204,10 @@ dht_periodic(const void *buf, size_t buflen,
                     blacklist_node(id, from, fromlen);
                 } else if(gp && sr == NULL) {
                     debugf("Unknown search!\n");
-                    new_node(id, from, fromlen, 1);
+                    new_node(id, from, fromlen, 1, encryption_variation);
                 } else {
                     int i;
-                    new_node(id, from, fromlen, 2);
+                    new_node(id, from, fromlen, 2, encryption_variation);
                     for(i = 0; i < nodes_len / 26; i++) {
                         unsigned char *ni = nodes + i * 26;
                         struct sockaddr_in sin;
@@ -1966,7 +2217,7 @@ dht_periodic(const void *buf, size_t buflen,
                         sin.sin_family = AF_INET;
                         memcpy(&sin.sin_addr, ni + 20, 4);
                         memcpy(&sin.sin_port, ni + 24, 2);
-                        new_node(ni, (struct sockaddr*)&sin, sizeof(sin), 0);
+                        new_node(ni, (struct sockaddr*)&sin, sizeof(sin), 0, encryption_variation);
                         if(sr && sr->af == AF_INET) {
                             insert_search_node(ni,
                                                (struct sockaddr*)&sin,
@@ -1983,7 +2234,7 @@ dht_periodic(const void *buf, size_t buflen,
                         sin6.sin6_family = AF_INET6;
                         memcpy(&sin6.sin6_addr, ni + 20, 16);
                         memcpy(&sin6.sin6_port, ni + 36, 2);
-                        new_node(ni, (struct sockaddr*)&sin6, sizeof(sin6), 0);
+                        new_node(ni, (struct sockaddr*)&sin6, sizeof(sin6), 0, encryption_variation);
                         if(sr && sr->af == AF_INET6) {
                             insert_search_node(ni,
                                                (struct sockaddr*)&sin6,
@@ -2020,10 +2271,10 @@ dht_periodic(const void *buf, size_t buflen,
                 sr = find_search(ttid, from->sa_family);
                 if(!sr) {
                     debugf("Unknown search!\n");
-                    new_node(id, from, fromlen, 1);
+                    new_node(id, from, fromlen, 1, encryption_variation);
                 } else {
                     int i;
-                    new_node(id, from, fromlen, 2);
+                    new_node(id, from, fromlen, 2, encryption_variation);
                     for(i = 0; i < sr->numnodes; i++)
                         if(id_cmp(sr->nodes[i].id, id) == 0) {
                             sr->nodes[i].request_time = 0;
@@ -2043,13 +2294,13 @@ dht_periodic(const void *buf, size_t buflen,
             break;
         case PING:
             debugf("Ping (%d)!\n", tid_len);
-            new_node(id, from, fromlen, 1);
+            new_node(id, from, fromlen, 1, encryption_variation);
             debugf("Sending pong.\n");
-            send_pong(from, fromlen, tid, tid_len);
+            send_pong(from, fromlen, tid, tid_len, challenge);
             break;
         case FIND_NODE:
             debugf("Find node!\n");
-            new_node(id, from, fromlen, 1);
+            new_node(id, from, fromlen, 1, encryption_variation);
             debugf("Sending closest nodes (%d).\n", want);
             send_closest_nodes(from, fromlen,
                                tid, tid_len, target, want,
@@ -2057,7 +2308,7 @@ dht_periodic(const void *buf, size_t buflen,
             break;
         case GET_PEERS:
             debugf("Get_peers!\n");
-            new_node(id, from, fromlen, 1);
+            new_node(id, from, fromlen, 1, encryption_variation);
             if(id_cmp(info_hash, zeroes) == 0) {
                 debugf("Eek!  Got get_peers with no info_hash.\n");
                 send_error(from, fromlen, tid, tid_len,
@@ -2085,7 +2336,7 @@ dht_periodic(const void *buf, size_t buflen,
             break;
         case ANNOUNCE_PEER:
             debugf("Announce peer!\n");
-            new_node(id, from, fromlen, 1);
+            new_node(id, from, fromlen, 1, encryption_variation);
             if(id_cmp(info_hash, zeroes) == 0) {
                 debugf("Announce_peer with no info_hash.\n");
                 send_error(from, fromlen, tid, tid_len,
@@ -2274,7 +2525,8 @@ dht_insert_node(const unsigned char *id, struct sockaddr *sa, int salen)
         return -1;
     }
 
-    n = new_node(id, (struct sockaddr*)sa, salen, 0);
+    // we don't know if it can do encryption yet - encrypted_version = 0
+    n = new_node(id, (struct sockaddr*)sa, salen, 0, 0);
     return !!n;
 }
 
@@ -2308,6 +2560,129 @@ dht_ping_node(struct sockaddr *sa, int salen)
         COPY(buf, offset, my_v, sizeof(my_v), size);    \
     }
 
+void lpoint2bin(EC_POINT *point, unsigned char *buf) {
+    int i;
+    char c[3] = "\0\0\0";
+    char *hex = EC_POINT_point2hex(group1, point, POINT_CONVERSION_COMPRESSED, NULL);
+    
+    for (i = 2; i < 46; i += 2) {
+        c[0] = hex[i]; c[1] = hex[i + 1];
+        buf[i / 2 - 1] = (unsigned char)strtol(c, NULL, 16);
+    }
+    OPENSSL_free(hex);
+}
+
+static int
+dht_send_encrypted(const void *buf, size_t len, int flags,
+                   const struct sockaddr *sa, int salen,
+                   unsigned char *key, unsigned short keylen, unsigned char variation)
+{
+    int s;
+    unsigned char envelope_key[SHA512_DIGEST_LENGTH], iv[EVP_MAX_IV_LENGTH];
+    EC_POINT *ephemiral_pub;
+    int block_length = EVP_CIPHER_block_size(EVP_aes_256_cbc());
+    EVP_CIPHER_CTX cipher;
+    int out, written;
+
+    if(salen == 0)
+        abort();
+    
+    if(node_blacklisted(sa, salen)) {
+        debugf("Attempting to send to blacklisted node.\n");
+        errno = EPERM;
+        return -1;
+    }
+    
+    if(sa->sa_family == AF_INET)
+        s = dht_socket;
+    else if(sa->sa_family == AF_INET6)
+        s = dht_socket6;
+    else
+        s = -1;
+    
+    if(s < 0) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    
+    dht_sec_key *skey = dht_sec_key_bin2pub(key, keylen, variation);
+    dht_sec_key *ephemiral = dht_sec_key_new(22, variation);
+    dht_sec_key_generate(ephemiral);
+    ECDH_compute_key(envelope_key, SHA512_DIGEST_LENGTH, dht_sec_key_pub(skey), ephemiral->pair, key_derivation_function);
+    
+    #define KEY_LENGTH 22 
+    ephemiral_pub = (EC_POINT*)EC_KEY_get0_public_key(ephemiral->pair);
+    
+    int rlen = len;
+    if (len % block_length != 0) {
+        rlen = (len / block_length) * block_length + block_length;
+    }
+    rlen += KEY_LENGTH;
+ 
+    unsigned char *bufEncrypted = malloc((size_t)rlen);
+    lpoint2bin(ephemiral_pub, bufEncrypted);
+    
+    memset(iv, 0, EVP_MAX_IV_LENGTH);
+    
+    EVP_CIPHER_CTX_init(&cipher);
+    EVP_EncryptInit_ex(&cipher, EVP_aes_256_cbc(), NULL, envelope_key, iv);
+    EVP_EncryptUpdate(&cipher, bufEncrypted + KEY_LENGTH, &out, buf, len);
+    EVP_EncryptFinal_ex(&cipher, bufEncrypted + KEY_LENGTH + out, &written);
+    EVP_CIPHER_CTX_cleanup(&cipher);
+    rlen = out + written + KEY_LENGTH;
+   
+            debugf("Sending Buf: ");
+            debug_printable(buf, rlen);
+            debugf("\n");
+ 
+    return sendto(s, bufEncrypted, rlen, flags, sa, salen);
+}
+
+struct node *
+get_node(const struct sockaddr *sa, int salen)
+{
+    int s;
+
+    if(salen == 0)
+        abort();
+
+    if(node_blacklisted(sa, salen)) {
+        debugf("Attempting to send to blacklisted node.\n");
+        errno = EPERM;
+        return NULL;
+    }
+
+    if(sa->sa_family == AF_INET)
+        s = dht_socket;
+    else if(sa->sa_family == AF_INET6)
+        s = dht_socket6;
+    else
+        return NULL;
+
+    struct bucket *b = NULL;
+    if (s == dht_socket)
+    {
+        b = buckets;
+    }
+    else if (s == dht_socket6)
+    {
+        b = buckets6;
+    }
+
+
+    struct node *n = b->nodes;
+    while(n)
+    {
+        if (strcmp(((struct sockaddr*)&n->ss)->sa_data, sa->sa_data) == 0)
+        {
+            break;
+        }
+
+        n = n->next;
+    }
+    return n;
+}
+
 static int
 dht_send(const void *buf, size_t len, int flags,
          const struct sockaddr *sa, int salen)
@@ -2323,19 +2698,26 @@ dht_send(const void *buf, size_t len, int flags,
         return -1;
     }
 
-    if(sa->sa_family == AF_INET)
-        s = dht_socket;
-    else if(sa->sa_family == AF_INET6)
-        s = dht_socket6;
-    else
-        s = -1;
-
-    if(s < 0) {
-        errno = EAFNOSUPPORT;
-        return -1;
+    struct node *n = get_node(sa, salen);
+    
+    if (n && n->encryption_version &&
+        n->encryption_version == 1)
+    {
+        debugf("send encrypted !!!! \n");
+        
+        return dht_send_encrypted(buf, len, flags, sa, salen, n->id, 20, n->encryption_version);
     }
-
-    return sendto(s, buf, len, flags, sa, salen);
+    else
+    {
+        if(sa->sa_family == AF_INET)
+            s = dht_socket;
+        else if(sa->sa_family == AF_INET6)
+            s = dht_socket6;
+        else
+            return 0;
+        debugf("send unencrypted\n");
+        return sendto(s, buf, len, flags, sa, salen);
+    }
 }
 
 int
@@ -2344,31 +2726,55 @@ send_ping(const struct sockaddr *sa, int salen,
 {
     char buf[512];
     int i = 0, rc;
-    rc = snprintf(buf + i, 512 - i, "d1:ad2:id20:"); INC(i, rc, 512);
+    rc = snprintf(buf + i, 512 - i, "d1:ad10:encryptioni1e2:id20:"); 
+    INC(i, rc, 512);
     COPY(buf, i, myid, 20, 512);
     rc = snprintf(buf + i, 512 - i, "e1:q4:ping1:t%d:", tid_len);
     INC(i, rc, 512);
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
+
+    unsigned char sha1Buf[20];
+    int error = generate_challenge(sa, salen, &sha1Buf);
+    if (error == 0) {
+        rc = snprintf(buf + i, 512 - i, "9:challenge20:");
+        INC(i, rc, 512);
+        COPY(buf, i, sha1Buf, 20, 512);
+    } 
     rc = snprintf(buf + i, 512 - i, "1:y1:qe"); INC(i, rc, 512);
     return dht_send(buf, i, 0, sa, salen);
+    
 
  fail:
     errno = ENOSPC;
     return -1;
 }
 
+
 int
 send_pong(const struct sockaddr *sa, int salen,
-          const unsigned char *tid, int tid_len)
+          const unsigned char *tid, int tid_len, const unsigned char *challenge)
 {
     char buf[512];
     int i = 0, rc;
-    rc = snprintf(buf + i, 512 - i, "d1:rd2:id20:"); INC(i, rc, 512);
+    rc = snprintf(buf + i, 512 - i, "d1:rd10:encryptioni1e2:id20:"); INC(i, rc, 512);
     COPY(buf, i, myid, 20, 512);
     rc = snprintf(buf + i, 512 - i, "e1:t%d:", tid_len); INC(i, rc, 512);
     COPY(buf, i, tid, tid_len, 512);
     ADD_V(buf, i, 512);
+        // check if node can encrypt - then give the challenge
+    struct node *n = get_node(sa, salen);
+ 
+    // this makes sure the traffic is encrypted
+    if (n && n->encryption_version &&
+        n->encryption_version == 1 &&
+    challenge)
+    {
+        rc = snprintf(buf + i, 512 - i, "9:challenge20:");
+        INC(i, rc, 512);
+        COPY(buf, i, challenge, 20, 512);
+    }
+
     rc = snprintf(buf + i, 512 - i, "1:y1:re"); INC(i, rc, 512);
     return dht_send(buf, i, 0, sa, salen);
 
@@ -2384,7 +2790,7 @@ send_find_node(const struct sockaddr *sa, int salen,
 {
     char buf[512];
     int i = 0, rc;
-    rc = snprintf(buf + i, 512 - i, "d1:ad2:id20:"); INC(i, rc, 512);
+    rc = snprintf(buf + i, 512 - i, "d1:ad10:encryptioni1e2:id20:"); INC(i, rc, 512);
     COPY(buf, i, myid, 20, 512);
     rc = snprintf(buf + i, 512 - i, "6:target20:"); INC(i, rc, 512);
     COPY(buf, i, target, 20, 512);
@@ -2417,7 +2823,7 @@ send_nodes_peers(const struct sockaddr *sa, int salen,
     char buf[2048];
     int i = 0, rc, j0, j, k, len;
 
-    rc = snprintf(buf + i, 2048 - i, "d1:rd2:id20:"); INC(i, rc, 2048);
+    rc = snprintf(buf + i, 2048 - i, "d1:rd10:encryptioni1e2:id20:"); INC(i, rc, 2048);
     COPY(buf, i, myid, 20, 2048);
     if(nodes_len > 0) {
         rc = snprintf(buf + i, 2048 - i, "5:nodes%d:", nodes_len);
@@ -2588,7 +2994,7 @@ send_get_peers(const struct sockaddr *sa, int salen,
     char buf[512];
     int i = 0, rc;
 
-    rc = snprintf(buf + i, 512 - i, "d1:ad2:id20:"); INC(i, rc, 512);
+    rc = snprintf(buf + i, 512 - i, "d1:ad10:encryptioni1e2:id20:"); INC(i, rc, 512);
     COPY(buf, i, myid, 20, 512);
     rc = snprintf(buf + i, 512 - i, "9:info_hash20:"); INC(i, rc, 512);
     COPY(buf, i, infohash, 20, 512);
@@ -2619,7 +3025,7 @@ send_announce_peer(const struct sockaddr *sa, int salen,
     char buf[512];
     int i = 0, rc;
 
-    rc = snprintf(buf + i, 512 - i, "d1:ad2:id20:"); INC(i, rc, 512);
+    rc = snprintf(buf + i, 512 - i, "d1:ad10:encryptioni1e2:id20:"); INC(i, rc, 512);
     COPY(buf, i, myid, 20, 512);
     rc = snprintf(buf + i, 512 - i, "9:info_hash20:"); INC(i, rc, 512);
     COPY(buf, i, infohash, 20, 512);
@@ -2647,7 +3053,7 @@ send_peer_announced(const struct sockaddr *sa, int salen,
     char buf[512];
     int i = 0, rc;
 
-    rc = snprintf(buf + i, 512 - i, "d1:rd2:id20:"); INC(i, rc, 512);
+    rc = snprintf(buf + i, 512 - i, "d1:rd10:encryptioni1e2:id20:"); INC(i, rc, 512);
     COPY(buf, i, myid, 20, 512);
     rc = snprintf(buf + i, 512 - i, "e1:t%d:", tid_len);
     INC(i, rc, 512);
@@ -2721,6 +3127,83 @@ dht_memmem(const void *haystack, size_t haystacklen,
 
 #endif
 
+EC_POINT *bin2lpoint(unsigned char *buf, EC_POINT *point) {
+    int i;
+    char hex[47];
+    hex[0] = '0'; hex[1] = '2';
+    hex[46] = 0;
+    for (i = 0; i < 22; i++) {
+        if (buf[i] / 16 >= 10) {
+            hex[i * 2 + 2] = (char)(0x41 + (buf[i] / 16 - 10));
+        } else {
+            hex[i * 2 + 2] = (char)(0x30 + buf[i] / 16);
+        }
+        if (buf[i] % 16 >= 10) {
+            hex[i * 2 + 3] = (char)(0x41 + ((buf[i] % 16) - 10));
+        } else {
+            hex[i * 2 + 3] = (char)(0x30 + (buf[i] % 16));
+        }
+    }
+    return EC_POINT_hex2point(group1, hex, point, NULL);
+}
+
+int decrypt(const unsigned char *input, int len, unsigned char *output, int *outlength)
+{
+    unsigned char envelope_key[SHA512_DIGEST_LENGTH];
+    unsigned char iv[EVP_MAX_IV_LENGTH];
+    unsigned char* result = NULL;
+    int decryptedLength = 0;
+    int outlen = 0;
+    EC_POINT *ephemeral_pub = EC_POINT_new(group1);
+    EVP_CIPHER_CTX cipher;
+    
+    if (bin2lpoint(input, ephemeral_pub))
+    {
+        memset(iv, 0, EVP_MAX_IV_LENGTH);
+        EVP_CIPHER_CTX_init(&cipher);
+        if (ECDH_compute_key(envelope_key, SHA512_DIGEST_LENGTH, ephemeral_pub, mykey->pair, key_derivation_function) != 0)
+        {
+            decryptedLength = len - 22;
+            result = malloc((size_t)decryptedLength + 1);
+            memset(result, (size_t)decryptedLength + 1, 0);
+            if (!EVP_DecryptInit_ex(&cipher, EVP_aes_256_cbc(), NULL, envelope_key, iv))
+            {
+                debugf("decrypt init failed\n");
+                goto failed;
+            }
+            if (!EVP_DecryptUpdate(&cipher, result, &decryptedLength, input + 22, decryptedLength)) {
+                debugf("decrypt update failed\n");
+                goto failed;
+            }
+            if (!EVP_DecryptFinal_ex(&cipher, result + decryptedLength, &outlen))
+            {
+                debugf("decrypt final failed\n");
+                goto failed;
+            }
+            decryptedLength += outlen;
+            debugf("successfully decrypted,len: %i, payload: ", decryptedLength);
+            debug_printable(result, decryptedLength);
+            debugf("\n");
+        } else {
+            debugf("ephimeral key computation failed\n");
+            result = 0;
+            decryptedLength = 0;
+        }
+        EVP_CIPHER_CTX_cleanup(&cipher);
+    }
+    *outlength = decryptedLength;
+    *output = result;
+    return 0;
+    failed:
+    if (result)
+    {
+        free(result);
+    }
+    *outlength = 0;
+    return -1;
+}
+                   
+
 static int
 parse_message(const unsigned char *buf, int buflen,
               unsigned char *tid_return, int *tid_len,
@@ -2731,7 +3214,8 @@ parse_message(const unsigned char *buf, int buflen,
               unsigned char *nodes6_return, int *nodes6_len,
               unsigned char *values_return, int *values_len,
               unsigned char *values6_return, int *values6_len,
-              int *want_return)
+              int *want_return,
+              unsigned char *encryption_variation, unsigned char *challenge, unsigned char *was_encrypted)
 {
     const unsigned char *p;
 
@@ -2741,6 +3225,23 @@ parse_message(const unsigned char *buf, int buflen,
         return -1;
     }
 
+    int newLen = 0;
+    size_t outbufLen = (size_t)((buflen + EVP_MAX_BLOCK_LENGTH) % EVP_MAX_BLOCK_LENGTH) * EVP_MAX_BLOCK_LENGTH;
+    const unsigned char *decryptedBuf = malloc(outbufLen);
+    memset(decryptedBuf, 0, outbufLen);    
+
+    int error = decrypt(buf, buflen, decryptedBuf, &newLen);
+    if (error == 0 && decryptedBuf && newLen)
+    {
+        buf = decryptedBuf;
+        buflen = newLen + 1;
+        debugf("Successfully decrypted\n");
+        if (was_encrypted) *was_encrypted = true;
+    } else {
+        if (was_encrypted) *was_encrypted = false;
+    }
+    
+    
 #define CHECK(ptr, len)                                                 \
     if(((unsigned char*)ptr) + (len) > (buf) + (buflen)) goto overflow;
 
@@ -2912,8 +3413,36 @@ parse_message(const unsigned char *buf, int buflen,
         }
     }
 
+    if (encryption_variation) {
+        p = dht_memmem(buf, buflen, "10:encryptioni", 14);
+        if (p) {
+            // node announced encryption support
+            char *q;
+            long variation = strtol((char*)p + 14, &q, 10);
+            if (variation != 1) {
+                debugf("Unknown encryption schema %li\n", variation);
+            } else {
+                debugf("ANNOUNCED ENCRYPTION %li\n", variation);
+                *encryption_variation = (unsigned char)variation;
+            }
+        }
+    }
+
+    if (challenge) {
+    unsigned lengthOfSearch = 2 + 9 + 3;
+    p = dht_memmem(buf, buflen, "9:challenge20:", lengthOfSearch);
+    if (p) {
+            CHECK(p + lengthOfSearch, 20);
+            memcpy(challenge, p + lengthOfSearch, 20);
+        } else {
+            memset(challenge, 0, 20);
+        }
+    }
+
 #undef CHECK
 
+    if (decryptedBuf != NULL)
+	free((void *)decryptedBuf);
     if(dht_memmem(buf, buflen, "1:y1:r", 6))
         return REPLY;
     if(dht_memmem(buf, buflen, "1:y1:e", 6))
@@ -2923,14 +3452,17 @@ parse_message(const unsigned char *buf, int buflen,
     if(dht_memmem(buf, buflen, "1:q4:ping", 9))
         return PING;
     if(dht_memmem(buf, buflen, "1:q9:find_node", 14))
-       return FIND_NODE;
+        return FIND_NODE;
     if(dht_memmem(buf, buflen, "1:q9:get_peers", 14))
         return GET_PEERS;
     if(dht_memmem(buf, buflen, "1:q13:announce_peer", 19))
-       return ANNOUNCE_PEER;
+        return ANNOUNCE_PEER;
     return -1;
 
  overflow:
     debugf("Truncated message.\n");
+	if (decryptedBuf != NULL) {
+		free((void *)decryptedBuf);
+	}
     return -1;
 }
