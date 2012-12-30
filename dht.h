@@ -20,6 +20,20 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 
+#include <openssl/ssl.h>
+#include <openssl/crypto.h>
+#include <openssl/ec.h>
+#include <openssl/ecdh.h>
+#include <openssl/ecdsa.h>
+
+typedef struct {
+    unsigned short len;
+    unsigned char variation;
+    EC_KEY *pair;
+} dht_sec_key;
+#define dht_sec_key_pub(key) (EC_KEY_get0_public_key(key->pair))
+#define dht_sec_key_priv(key) (EC_KEY_get0_private_key(key->pair))
+
 typedef void
 dht_callback(void *closure, int event,
              unsigned char *info_hash,
@@ -30,10 +44,12 @@ dht_callback(void *closure, int event,
 #define DHT_EVENT_VALUES6 2
 #define DHT_EVENT_SEARCH_DONE 3
 #define DHT_EVENT_SEARCH_DONE6 4
+ 
 
 extern FILE *dht_debug;
 
-int dht_init(int s, int s6, const unsigned char *id, const unsigned char *v);
+dht_sec_key* dht_generate_key(unsigned short variation);
+int dht_init(int s, int s6, dht_sec_key *key, const unsigned char *v);
 int dht_insert_node(const unsigned char *id, struct sockaddr *sa, int salen);
 int dht_ping_node(struct sockaddr *sa, int salen);
 int dht_periodic(const void *buf, size_t buflen,
@@ -56,3 +72,6 @@ void dht_hash(void *hash_return, int hash_size,
               const void *v2, int len2,
               const void *v3, int len3);
 int dht_random_bytes(void *buf, size_t size);
+
+
+
